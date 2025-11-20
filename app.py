@@ -281,7 +281,7 @@ def train_and_return(df_load_local):
     y_pred = rf.predict(X_test)
 
     metrics = {"mae": float(mean_absolute_error(y_test, y_pred)),
-               "rmse": float(mean_squared_error(y_test, y_pred, squared=False)),
+               "rmse": float(mean_squared_error(y_test, y_pred) ** 0.5),
                "r2": float(r2_score(y_test, y_pred))}
 
     return {"model": rf, "metrics": metrics, "last_df": df_model, "value_col": value_col}
