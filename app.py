@@ -1,5 +1,5 @@
 # -------------------------------
-# Energy Demand Predictor 
+# Energy Demand Predictor (Low-Memory Version)
 # -------------------------------
 
 import streamlit as st
@@ -10,6 +10,7 @@ from urllib.parse import quote
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import altair as alt
 
 st.set_page_config(page_title="Energy Demand Predictor", layout="wide")
 
@@ -24,12 +25,9 @@ def gh_raw(filename):
 
 
 # ---------- CSV Loader ----------
+@st.cache_data
 def read_from_url(url):
-    try:
-        return pd.read_csv(url)
-    except Exception as e:
-        st.error(f"Failed to load {url}: {e}")
-        return None
+    return pd.read_csv(url)
 
 
 df_load = read_from_url(gh_raw(FILE_LOAD))
@@ -50,6 +48,7 @@ def parse_timestamp(df):
 
 
 # ---------- Training Function ----------
+@st.cache_resource
 def train(df_load_local):
     df = parse_timestamp(df_load_local).sort_values("timestamp")
 
@@ -66,7 +65,7 @@ def train(df_load_local):
 
     dfm = df.dropna().reset_index(drop=True)
 
-    X = dfm[["hour", "dow", "month", "lag1", "lag24", "roll24"]]
+    X = dfm[["hour","dow","month","lag1","lag24","roll24"]]
     y = dfm[value_col]
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -76,16 +75,7 @@ def train(df_load_local):
     model = RandomForestRegressor(n_estimators=120, random_state=42)
     model.fit(X_train, y_train)
 
-    y_pred = model.predict(X_test)
-
-    # Metrics calculated but NOT displayed
-    metrics = {
-        "MAE": float(mean_absolute_error(y_test, y_pred)),
-        "RMSE": float(mean_squared_error(y_test, y_pred) ** 0.5),
-        "R2": float(r2_score(y_test, y_pred))
-    }
-
-    return model, dfm, value_col, metrics
+    return model, dfm, value_col
 
 
 # ---------- UI ----------
@@ -99,86 +89,67 @@ pred_horizon = st.number_input(
 predict_button = st.button("Predict")
 
 
-# ---------- Ensure model is trained when Predict is pressed ----------
+# ---------- Prediction ----------
 if predict_button:
-    # If model doesn't exist, train it first
-    if "model" not in st.session_state:
-        st.info("Training model for the first time…")
-        model, dfm, valcol, mets = train(df_load)
-        st.session_state["model"] = model
-        st.session_state["df"] = dfm
-        st.session_state["valcol"] = valcol
-        st.session_state["metrics"] = mets
 
-        # Save model to local file
-        with open("trained_model.pkl", "wb") as f:
-            pickle.dump(model, f)
+    st.info("Training model (cached)…")
+    model, dfm, value_col = train(df_load)
+    st.success("Model ready!")
 
-        st.success("Training complete!")
-        st.download_button(
-            "Download Trained Model (PKL)",
-            open("trained_model.pkl", "rb"),
-            "trained_model.pkl"
+    # -------------------------------------
+    # MEMORY-SAFE PREDICTION LOGIC
+    # -------------------------------------
+    last_ts = dfm["timestamp"].iloc[-1]
+    future_ts = [last_ts + pd.Timedelta(hours=i+1) for i in range(pred_horizon)]
+
+    # Keep only last 24 values for lightweight lag/rolling
+    last_values = dfm[value_col].iloc[-24:].tolist()
+
+    preds = []
+
+    for t in future_ts:
+        lag1 = last_values[-1]
+        lag24 = last_values[-24] if len(last_values) >= 24 else lag1
+        roll24 = np.mean(last_values)
+
+        row = {
+            "hour": t.hour,
+            "dow": t.dayofweek,
+            "month": t.month,
+            "lag1": lag1,
+            "lag24": lag24,
+            "roll24": roll24
+        }
+
+        pred = model.predict(pd.DataFrame([row]))[0]
+        preds.append(pred)
+
+        # update small in-memory buffer (always max 24 entries)
+        last_values.append(pred)
+        if len(last_values) > 24:
+            last_values.pop(0)
+
+    # Build output minimal DataFrame
+    out = pd.DataFrame({"timestamp": future_ts, "prediction": preds})
+
+    # ---------- Plot using Altair (very memory-efficient) ----------
+    chart = (
+        alt.Chart(out)
+        .mark_line(point=True)
+        .encode(
+            x="timestamp:T",
+            y="prediction:Q",
+            tooltip=["timestamp:T", "prediction:Q"]
         )
+        .properties(title=f"Next {pred_horizon}-Hour Forecast", width=700)
+    )
 
-    # Proceed to prediction & plotting
-    if "model" in st.session_state:
-        st.header(f"Predictions (Next {pred_horizon} Hours)")
+    st.altair_chart(chart, use_container_width=True)
 
-        model = st.session_state["model"]
-        dfm = st.session_state["df"].copy()
-        value_col = st.session_state["valcol"]
-
-        # safety checks
-        if dfm is None or dfm.empty:
-            st.error("Training data not available. Cannot make predictions.")
-        else:
-            last_ts = dfm["timestamp"].iloc[-1]
-            future_ts = [last_ts + pd.Timedelta(hours=i + 1) for i in range(int(pred_horizon))]
-
-            preds = []
-            temp_df = dfm.copy()
-
-            for t in future_ts:
-                # compute features using latest available values in temp_df
-                lag1_val = temp_df[value_col].iloc[-1]
-                lag24_val = temp_df[value_col].iloc[-24] if len(temp_df) >= 24 else lag1_val
-                roll24_val = temp_df[value_col].rolling(24, min_periods=1).mean().iloc[-1]
-
-                row = {
-                    "hour": t.hour,
-                    "dow": t.dayofweek,
-                    "month": t.month,
-                    "lag1": lag1_val,
-                    "lag24": lag24_val,
-                    "roll24": roll24_val
-                }
-                X_new = pd.DataFrame([row])
-                pred = float(model.predict(X_new)[0])
-                preds.append(pred)
-
-                # append prediction back to temp_df so next step can use it
-                new_row = {**row, value_col: pred, "timestamp": t}
-                temp_df.loc[len(temp_df)] = new_row
-
-            out = pd.DataFrame({"timestamp": future_ts, "prediction": preds})
-            # ensure timestamp is datetime and set index for plotting
-            out["timestamp"] = pd.to_datetime(out["timestamp"])
-            out_plot = out.set_index("timestamp")["prediction"]
-
-            # Use Streamlit's built-in chart (more robust)
-            st.subheader("Forecast Chart")
-            st.line_chart(out_plot)
-
-            # Also show numeric table so user can confirm values
-            st.subheader("Prediction Table")
-            st.dataframe(out.reset_index(drop=True))
-
-            # CSV download
-            csv_bytes = out.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                f"Download {pred_horizon}h Predictions CSV",
-                csv_bytes,
-                f"predictions_{pred_horizon}h.csv",
-                "text/csv"
-            )
+    # ---------- Download ----------
+    st.download_button(
+        label=f"Download {pred_horizon}h Predictions CSV",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name=f"predictions_{pred_horizon}h.csv",
+        mime="text/csv"
+    )
