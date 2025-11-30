@@ -113,7 +113,6 @@ if "model" not in st.session_state and predict_button:
         pickle.dump(model, f)
 
     st.success("Training complete!")
-    st.write(mets)
 
     st.download_button(
         "Download Trained Model (PKL)",
