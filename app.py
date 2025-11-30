@@ -5,7 +5,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import pickle
 from urllib.parse import quote
 from sklearn.ensemble import RandomForestRegressor
@@ -67,7 +66,7 @@ def train(df_load_local):
 
     dfm = df.dropna().reset_index(drop=True)
 
-    X = dfm[["hour","dow","month","lag1","lag24","roll24"]]
+    X = dfm[["hour", "dow", "month", "lag1", "lag24", "roll24"]]
     y = dfm[value_col]
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -79,10 +78,10 @@ def train(df_load_local):
 
     y_pred = model.predict(X_test)
 
-    # Metrics calculated but not shown
+    # Metrics calculated but NOT displayed
     metrics = {
         "MAE": float(mean_absolute_error(y_test, y_pred)),
-        "RMSE": float(mean_squared_error(y_test, y_pred)**0.5),
+        "RMSE": float(mean_squared_error(y_test, y_pred) ** 0.5),
         "R2": float(r2_score(y_test, y_pred))
     }
 
@@ -100,70 +99,86 @@ pred_horizon = st.number_input(
 predict_button = st.button("Predict")
 
 
-# ---------- Auto-Train on First Attempt ----------
-if "model" not in st.session_state and predict_button:
-    st.info("Training model for the first time…")
-    model, dfm, valcol, mets = train(df_load)
-    st.session_state["model"] = model
-    st.session_state["df"] = dfm
-    st.session_state["valcol"] = valcol
-    st.session_state["metrics"] = mets
+# ---------- Ensure model is trained when Predict is pressed ----------
+if predict_button:
+    # If model doesn't exist, train it first
+    if "model" not in st.session_state:
+        st.info("Training model for the first time…")
+        model, dfm, valcol, mets = train(df_load)
+        st.session_state["model"] = model
+        st.session_state["df"] = dfm
+        st.session_state["valcol"] = valcol
+        st.session_state["metrics"] = mets
 
-    # Save model to local file
-    with open("trained_model.pkl", "wb") as f:
-        pickle.dump(model, f)
+        # Save model to local file
+        with open("trained_model.pkl", "wb") as f:
+            pickle.dump(model, f)
 
-    st.success("Training complete!")
+        st.success("Training complete!")
+        st.download_button(
+            "Download Trained Model (PKL)",
+            open("trained_model.pkl", "rb"),
+            "trained_model.pkl"
+        )
 
-    # Removed metrics display
-    # st.write(mets)
+    # Proceed to prediction & plotting
+    if "model" in st.session_state:
+        st.header(f"Predictions (Next {pred_horizon} Hours)")
 
-    st.download_button(
-        "Download Trained Model (PKL)",
-        open("trained_model.pkl", "rb"),
-        "trained_model.pkl"
-    )
+        model = st.session_state["model"]
+        dfm = st.session_state["df"].copy()
+        value_col = st.session_state["valcol"]
 
+        # safety checks
+        if dfm is None or dfm.empty:
+            st.error("Training data not available. Cannot make predictions.")
+        else:
+            last_ts = dfm["timestamp"].iloc[-1]
+            future_ts = [last_ts + pd.Timedelta(hours=i + 1) for i in range(int(pred_horizon))]
 
-# ---------- Prediction ----------
-if predict_button and "model" in st.session_state:
-    st.header(f"Predictions (Next {pred_horizon} Hours)")
+            preds = []
+            temp_df = dfm.copy()
 
-    model = st.session_state["model"]
-    dfm = st.session_state["df"]
-    value_col = st.session_state["valcol"]
+            for t in future_ts:
+                # compute features using latest available values in temp_df
+                lag1_val = temp_df[value_col].iloc[-1]
+                lag24_val = temp_df[value_col].iloc[-24] if len(temp_df) >= 24 else lag1_val
+                roll24_val = temp_df[value_col].rolling(24, min_periods=1).mean().iloc[-1]
 
-    last_ts = dfm["timestamp"].iloc[-1]
-    future_ts = [last_ts + pd.Timedelta(hours=i+1) for i in range(int(pred_horizon))]
+                row = {
+                    "hour": t.hour,
+                    "dow": t.dayofweek,
+                    "month": t.month,
+                    "lag1": lag1_val,
+                    "lag24": lag24_val,
+                    "roll24": roll24_val
+                }
+                X_new = pd.DataFrame([row])
+                pred = float(model.predict(X_new)[0])
+                preds.append(pred)
 
-    preds = []
-    temp_df = dfm.copy()
+                # append prediction back to temp_df so next step can use it
+                new_row = {**row, value_col: pred, "timestamp": t}
+                temp_df.loc[len(temp_df)] = new_row
 
-    for t in future_ts:
-        row = {
-            "hour": t.hour,
-            "dow": t.dayofweek,
-            "month": t.month,
-            "lag1": temp_df[value_col].iloc[-1],
-            "lag24": temp_df[value_col].iloc[-24] if len(temp_df)>=24 else temp_df[value_col].iloc[-1],
-            "roll24": temp_df[value_col].rolling(24, min_periods=1).mean().iloc[-1]
-        }
-        X_new = pd.DataFrame([row])
-        pred = model.predict(X_new)[0]
-        preds.append(pred)
-        temp_df.loc[len(temp_df)] = {**row, value_col: pred, "timestamp": t}
+            out = pd.DataFrame({"timestamp": future_ts, "prediction": preds})
+            # ensure timestamp is datetime and set index for plotting
+            out["timestamp"] = pd.to_datetime(out["timestamp"])
+            out_plot = out.set_index("timestamp")["prediction"]
 
-    out = pd.DataFrame({"timestamp": future_ts, "prediction": preds})
+            # Use Streamlit's built-in chart (more robust)
+            st.subheader("Forecast Chart")
+            st.line_chart(out_plot)
 
-    fig, ax = plt.subplots(figsize=(10,4))
-    ax.plot(out["timestamp"], out["prediction"], marker="o")
-    plt.xticks(rotation=45)
-    ax.set_title(f"Next {pred_horizon}-Hour Forecast")
-    st.pyplot(fig)
+            # Also show numeric table so user can confirm values
+            st.subheader("Prediction Table")
+            st.dataframe(out.reset_index(drop=True))
 
-    st.download_button(
-        f"Download {pred_horizon}h Predictions CSV",
-        out.to_csv(index=False),
-        f"predictions_{pred_horizon}h.csv",
-        "text/csv"
-    )
+            # CSV download
+            csv_bytes = out.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"Download {pred_horizon}h Predictions CSV",
+                csv_bytes,
+                f"predictions_{pred_horizon}h.csv",
+                "text/csv"
+            )
