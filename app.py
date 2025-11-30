@@ -79,6 +79,7 @@ def train(df_load_local):
 
     y_pred = model.predict(X_test)
 
+    # Metrics calculated but not shown
     metrics = {
         "MAE": float(mean_absolute_error(y_test, y_pred)),
         "RMSE": float(mean_squared_error(y_test, y_pred)**0.5),
@@ -113,6 +114,9 @@ if "model" not in st.session_state and predict_button:
         pickle.dump(model, f)
 
     st.success("Training complete!")
+
+    # Removed metrics display
+    # st.write(mets)
 
     st.download_button(
         "Download Trained Model (PKL)",
